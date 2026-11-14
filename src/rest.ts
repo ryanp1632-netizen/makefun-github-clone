@@ -768,10 +768,32 @@ route('PUT', '/repos/:o/:r/pulls/:n/merge', (ctx, [o, n, num]) => {
 
 // ------------------------------------------------------------------ dispatch
 
+// Routes indexed by method and segment count (wildcard routes kept apart), built on first use.
+let index: Map<string, typeof routes> | null = null;
+function candidates(method: string, count: number): typeof routes {
+  if (index === null) {
+    index = new Map();
+    for (const rt of routes) {
+      const wild = rt.parts[rt.parts.length - 1] === '*';
+      const k = wild ? `${rt.method}:*` : `${rt.method}:${rt.parts.length}`;
+      const list = index.get(k) ?? [];
+      list.push(rt);
+      index.set(k, list);
+    }
+  }
+  const key = `${method}#${count}`;
+  let combined = index.get(key);
+  if (combined === undefined) {
+    combined = [...(index.get(`${method}:${count}`) ?? []), ...(index.get(`${method}:*`) ?? [])];
+    index.set(key, combined);
+  }
+  return combined;
+}
+
 export function dispatch(ctx: Ctx): Reply {
   const parts = ctx.path.split('/').filter((p) => p !== '');
   let methodMismatch = false;
-  for (const rt of routes) {
+  for (const rt of candidates(ctx.method, parts.length)) {
     const params: string[] = [];
     let matched = true;
     let i = 0;
