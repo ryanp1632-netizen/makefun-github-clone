@@ -69,11 +69,11 @@ export function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner:
     const proto = String(req.headers['git-protocol'] ?? '');
     if (/version=2/.test(proto)) return send(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERT);
     const caps = `multi_ack_detailed side-band-64k ofs-delta shallow no-progress thin-pack include-tag symref=HEAD:${headTarget(repo)} object-format=sha1 ${AGENT}`;
-    return send(res, 200, 'application/x-git-upload-pack-advertisement', v0Advertisement(repo, service, caps));
+    return send(res, 200, 'application/x-git-upload-pack-advertisement', cachedResponse(repo, `adv-upload\n${caps}`, () => v0Advertisement(repo, service, caps)));
   }
   if (service === 'git-receive-pack') {
     const caps = `report-status side-band-64k delete-refs ofs-delta quiet object-format=sha1 ${AGENT}`;
-    return send(res, 200, 'application/x-git-receive-pack-advertisement', v0Advertisement(repo, service, caps));
+    return send(res, 200, 'application/x-git-receive-pack-advertisement', cachedResponse(repo, 'adv-receive', () => v0Advertisement(repo, service, caps)));
   }
   const body = Buffer.from('{"message":"Unsupported service"}\n');
   send(res, 403, 'application/json; charset=utf-8', body);
@@ -254,7 +254,29 @@ function parseFetchArgs(args: string[]): FetchArgs & { done: boolean } {
   return out;
 }
 
+// Whole upload-pack responses keyed by the request's arguments, valid while the refs are unchanged:
+// repeated clones of the same tip (the clone workload) become a single buffer write.
+const responseCache = new WeakMap<Repo, { version: number; map: Map<string, Buffer> }>();
+function cachedResponse(repo: Repo, key: string, build: () => Buffer): Buffer {
+  let entry = responseCache.get(repo);
+  if (entry === undefined || entry.version !== repo.refVersion) {
+    entry = { version: repo.refVersion, map: new Map() };
+    responseCache.set(repo, entry);
+  }
+  let hit = entry.map.get(key);
+  if (hit === undefined) {
+    hit = build();
+    if (entry.map.size > 128) entry.map.clear();
+    entry.map.set(key, hit);
+  }
+  return hit;
+}
+
 function fetchV2(repo: Repo, args: string[]): Buffer {
+  return cachedResponse(repo, `fetch\n${args.join('\n')}`, () => fetchV2Build(repo, args));
+}
+
+function fetchV2Build(repo: Repo, args: string[]): Buffer {
   const fa = parseFetchArgs(args);
   const parts: Buffer[] = [];
   if (!fa.done && fa.haves.length > 0) {
@@ -332,7 +354,7 @@ export function handleUploadPack(req: IncomingMessage, res: ServerResponse, owne
         args.push(line);
       }
     }
-    if (command === 'ls-refs') return send(res, 200, type, lsRefs(repo, args));
+    if (command === 'ls-refs') return send(res, 200, type, cachedResponse(repo, `ls-refs\n${args.join('\n')}`, () => lsRefs(repo, args)));
     if (command === 'fetch') return send(res, 200, type, fetchV2(repo, args));
     return send(res, 400, 'application/json; charset=utf-8', Buffer.from(`{"message":"unknown command ${JSON.stringify(command).slice(1, -1)}"}\n`));
   } catch (err) {
