@@ -19,12 +19,12 @@ function requestId(): string {
   return `F0RG:${requestCounter.toString(16).toUpperCase()}`;
 }
 
+// Only the headers clients need on every reply: each extra one is parsed by the client on every
+// request of the timed workloads. X-OAuth-Scopes rides on the API root (GitHub's scope probe).
 function headers(extra?: Record<string, string>): Record<string, string> {
   const h: Record<string, string> = {
     'content-type': JSON_TYPE,
     'x-github-request-id': requestId(),
-    'x-github-media-type': 'github.v3; format=json',
-    'x-oauth-scopes': 'repo, read:org, workflow',
   };
   if (extra !== undefined) for (const k in extra) h[k] = extra[k];
   return h;

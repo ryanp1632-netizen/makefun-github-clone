@@ -66,7 +66,7 @@ class Response implements Res {
       head += `${k}: ${this.head[k]}\r\n`;
     }
     if (!hasLength && this.status !== 204) head += `content-length: ${buf === null ? 0 : buf.length}\r\n`;
-    head += this.close ? 'connection: close\r\n\r\n' : 'connection: keep-alive\r\n\r\n';
+    head += this.close ? 'connection: close\r\n\r\n' : '\r\n';
     if (this.socket.destroyed) return;
     if (buf === null || buf.length === 0 || this.isHead || this.status === 204) this.socket.write(head);
     else if (buf.length < 16384) this.socket.write(Buffer.concat([Buffer.from(head, 'latin1'), buf]));

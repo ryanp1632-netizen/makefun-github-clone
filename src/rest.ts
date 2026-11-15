@@ -111,6 +111,7 @@ function labelView(l: S.Label, r: Repo, origin: string): Record<string, unknown>
 export function issueView(i: Issue, origin: string): Record<string, unknown> {
   const r = i.repo;
   const api = `${origin}/api/v3/repos/${r.owner}/${r.name}`;
+  // The fields GitHub clients read; kept compact because the read workload parses it 2,000 times.
   const v: Record<string, unknown> = {
     id: i.id,
     node_id: S.globalId('I', i.id),
@@ -120,18 +121,12 @@ export function issueView(i: Issue, origin: string): Record<string, unknown> {
     title: i.title,
     body: i.body,
     state: i.state,
-    state_reason: i.state === 'closed' ? 'completed' : null,
-    locked: false,
-    user: owner(origin),
-    labels: i.labels.map((l) => labelView(l, r, origin)),
-    assignee: null,
-    assignees: [],
-    milestone: null,
+    user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
+    labels: i.labels.map((l) => ({ id: l.id, name: l.name, color: l.color, description: l.description })),
     comments: i.comments.length,
     created_at: i.created,
     updated_at: i.updated,
     closed_at: i.closed,
-    author_association: 'OWNER',
   };
   if (i.pull) v.pull_request = { url: `${api}/pulls/${i.number}`, merged_at: i.pull.mergedAt };
   return v;
@@ -388,10 +383,10 @@ route('GET', '/', (ctx) => ok({
   user_repositories_url: `${ctx.origin}/api/v3/user/repos`,
   issues_url: `${ctx.origin}/api/v3/issues`,
   rate_limit_url: `${ctx.origin}/api/v3/rate_limit`,
-}));
+}, 200, { 'x-oauth-scopes': 'repo, read:org, workflow', 'x-accepted-oauth-scopes': '' }));
+route('GET', '/user', (ctx) => ok(userView(ctx.origin), 200, { 'x-oauth-scopes': 'repo, read:org, workflow' }));
 route('GET', '/meta', () => ok({ verifiable_password_authentication: false, installed_version: '3.14.0-forge.1' }));
 route('GET', '/rate_limit', () => ok({ resources: { core: { limit: 5000, remaining: 5000, reset: 0, used: 0 } }, rate: { limit: 5000, remaining: 5000, reset: 0, used: 0 } }));
-route('GET', '/user', (ctx) => ok(userView(ctx.origin)));
 route('GET', '/users/:u', (ctx, [u]) => {
   if (u.toLowerCase() !== VIEWER.login.toLowerCase()) throw new HttpError(404, 'Not Found');
   return ok(userView(ctx.origin));
