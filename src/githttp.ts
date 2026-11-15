@@ -1,6 +1,6 @@
 // Git smart HTTP: info/refs advertisements, upload-pack (protocol v2 and v0) and receive-pack (v0).
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Req as IncomingMessage, Res as ServerResponse } from './http1.ts';
 import {
   DELIM, FLUSH, ZERO, isOid, parseTagTarget, parseTree, pkt, readPack, readPackets, sideband, writePack,
   type GitObject, type Packet,

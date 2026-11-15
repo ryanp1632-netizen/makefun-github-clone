@@ -1,7 +1,9 @@
-// The HTTP front door: one node:http server routing /healthz, git smart HTTP, REST v3, GraphQL and
-// MCP, with bearer-token auth and GitHub's JSON reply discipline.
+// The HTTP front door: routes /healthz, git smart HTTP, REST v3, GraphQL and MCP, with bearer-token
+// auth and GitHub's JSON reply discipline. Served by the raw HTTP/1.1 server in http1.ts (one socket
+// write per response); every handler is synchronous because the body arrives already read.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import { createRawServer, type Req, type Res } from './http1.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './githttp.ts';
 import { HttpError, dispatch, type Ctx } from './rest.ts';
 import { executeGraphql } from './graphql.ts';
@@ -9,106 +11,91 @@ import { handleMcp } from './mcp.ts';
 
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const JSON_TYPE = 'application/json; charset=utf-8';
+const EMPTY = new URLSearchParams('');
 
 let requestCounter = 0;
 function requestId(): string {
   requestCounter += 1;
-  return `F0RG:${requestCounter.toString(16).toUpperCase().padStart(8, '0')}`;
+  return `F0RG:${requestCounter.toString(16).toUpperCase()}`;
 }
 
-function baseHeaders(): Record<string, string | number> {
-  return {
+function headers(extra?: Record<string, string>): Record<string, string> {
+  const h: Record<string, string> = {
     'content-type': JSON_TYPE,
     'x-github-request-id': requestId(),
     'x-github-media-type': 'github.v3; format=json',
     'x-oauth-scopes': 'repo, read:org, workflow',
-    'x-accepted-oauth-scopes': 'repo',
   };
+  if (extra !== undefined) for (const k in extra) h[k] = extra[k];
+  return h;
 }
 
-function sendText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
-  const headers = baseHeaders();
-  headers['content-length'] = Buffer.byteLength(text);
-  for (const [k, v] of Object.entries(extra)) headers[k] = v;
-  res.writeHead(status, headers);
+function sendText(res: Res, status: number, text: string, extra?: Record<string, string>): void {
+  res.writeHead(status, headers(extra));
   res.end(text);
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+function sendJson(res: Res, status: number, body: unknown, extra?: Record<string, string>): void {
   sendText(res, status, `${JSON.stringify(body)}\n`, extra);
 }
 
-function sendError(res: ServerResponse, status: number, message: string, extra: Record<string, unknown> = {}): void {
+function sendError(res: Res, status: number, message: string, extra: Record<string, unknown> = {}): void {
   sendJson(res, status, { message, documentation_url: 'https://docs.github.com/rest', status: String(status), ...extra });
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on('data', (c: Buffer) => {
-      size += c.length;
-      if (size > 256 * 1024 * 1024) {
-        reject(new Error('body too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
 /** 'ok', 'missing' or 'bad' for the request's credentials. */
-function auth(req: IncomingMessage): 'ok' | 'missing' | 'bad' {
+function auth(req: Req): 'ok' | 'missing' | 'bad' {
   const h = req.headers.authorization;
   if (h === undefined || h === '') return 'missing';
-  const m = /^(?:Bearer|token)\s+(\S+)\s*$/i.exec(h);
-  let token = m?.[1];
-  if (token === undefined && /^Basic\s+/i.test(h)) {
-    const decoded = Buffer.from(h.replace(/^Basic\s+/i, ''), 'base64').toString('utf8');
-    token = decoded.slice(decoded.indexOf(':') + 1);
+  let token: string | undefined;
+  if (h.startsWith('Bearer ')) token = h.slice(7).trim();
+  else {
+    const m = /^(?:Bearer|token)\s+(\S+)\s*$/i.exec(h);
+    token = m?.[1];
+    if (token === undefined && /^Basic\s+/i.test(h)) {
+      const decoded = Buffer.from(h.replace(/^Basic\s+/i, ''), 'base64').toString('utf8');
+      token = decoded.slice(decoded.indexOf(':') + 1);
+    }
   }
   if (token === undefined || token === '') return 'bad';
   if (TOKEN !== '' && token !== TOKEN) return 'bad';
   return 'ok';
 }
 
-function originOf(req: IncomingMessage): string {
-  return `http://${req.headers.host ?? 'localhost'}`;
-}
+const GIT_RE = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const method = req.method ?? 'GET';
-  const rawUrl = req.url ?? '/';
+function handle(req: Req, res: Res): void {
+  const method = req.method;
+  const rawUrl = req.url;
   const q = rawUrl.indexOf('?');
   const path = q < 0 ? rawUrl : rawUrl.slice(0, q);
   const search = q < 0 ? '' : rawUrl.slice(q + 1);
 
   if (path === '/healthz') return sendJson(res, 200, { ok: true });
 
-  // git smart HTTP: /{owner}/{repo}.git/...
-  const git = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
-  if (git !== null) {
-    const owner = decodeURIComponent(git[1]);
-    const name = decodeURIComponent(git[2]);
-    if (auth(req) === 'bad') {
-      res.writeHead(401, { 'content-type': JSON_TYPE, 'www-authenticate': 'Basic realm="forge"' });
-      res.end('{"message":"Bad credentials"}\n');
-      return;
+  const isApi = path.startsWith('/api/v3');
+  if (!isApi && (path.endsWith('.git/info/refs') || path.endsWith('.git/git-upload-pack') || path.endsWith('.git/git-receive-pack'))) {
+    const git = GIT_RE.exec(path);
+    if (git !== null) {
+      const owner = decodeURIComponent(git[1]);
+      const name = decodeURIComponent(git[2]);
+      if (auth(req) === 'bad') {
+        res.writeHead(401, { 'content-type': JSON_TYPE, 'www-authenticate': 'Basic realm="forge"' });
+        res.end('{"message":"Bad credentials"}\n');
+        return;
+      }
+      if (git[3] === 'info/refs' && method === 'GET') return handleInfoRefs(req, res, owner, name, new URLSearchParams(search).get('service'));
+      if (method === 'POST' && git[3] === 'git-upload-pack') return handleUploadPack(req, res, owner, name, req.body);
+      if (method === 'POST' && git[3] === 'git-receive-pack') return handleReceivePack(res, owner, name, req.body);
+      return sendError(res, 405, 'Method Not Allowed');
     }
-    if (git[3] === 'info/refs' && method === 'GET') return handleInfoRefs(req, res, owner, name, new URLSearchParams(search).get('service'));
-    if (method === 'POST' && git[3] === 'git-upload-pack') return handleUploadPack(req, res, owner, name, await readBody(req));
-    if (method === 'POST' && git[3] === 'git-receive-pack') return handleReceivePack(res, owner, name, await readBody(req));
-    return sendError(res, 405, 'Method Not Allowed');
   }
 
-  const isApi = path === '/api/v3' || path.startsWith('/api/v3/');
+  const isRestApi = isApi && (path.length === 7 || path.charCodeAt(7) === 47);
   const isGraphql = path === '/api/graphql' || path === '/graphql' || path === '/api/graphql/';
   const isMcp = path === '/mcp' || path === '/mcp/';
 
-  if (!isApi && !isGraphql && !isMcp) {
+  if (!isRestApi && !isGraphql && !isMcp) {
     if (method === 'GET' && path === '/') return sendJson(res, 200, { message: 'forge', api: '/api/v3', graphql: '/api/graphql', mcp: '/mcp' });
     return sendError(res, 404, 'Not Found');
   }
@@ -123,8 +110,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return sendError(res, 401, a === 'missing' ? 'Requires authentication' : 'Bad credentials');
   }
 
-  const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
-  const origin = originOf(req);
+  const body = req.body;
+  const origin = `http://${req.headers.host ?? 'localhost'}`;
 
   if (isMcp) {
     if (method === 'GET') return sendError(res, 405, 'Method Not Allowed: this server does not stream on GET');
@@ -167,17 +154,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const ctx: Ctx = {
     method: method === 'HEAD' ? 'GET' : method,
     path: path.length > 7 ? path.slice(7) : '/',
-    query: new URLSearchParams(search),
+    query: search === '' ? EMPTY : new URLSearchParams(search),
     body: parsedBody,
     origin,
   };
-  if (ctx.path === '') ctx.path = '/';
   try {
     const reply = dispatch(ctx);
     if (reply.status === 204) {
-      const headers = baseHeaders();
-      delete headers['content-type'];
-      res.writeHead(204, headers);
+      const h = headers();
+      delete h['content-type'];
+      res.writeHead(204, h);
       res.end();
       return;
     }
@@ -191,16 +177,5 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 }
 
 export function createApp(): Server {
-  const server = createServer({ keepAliveTimeout: 120_000, headersTimeout: 120_000, requestTimeout: 0 }, (req, res) => {
-    handle(req, res).catch((err: unknown) => {
-      process.stderr.write(`[forge] unhandled: ${(err as Error)?.stack ?? String(err)}\n`);
-      if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
-      else res.destroy();
-    });
-  });
-  server.on('connection', (socket) => socket.setNoDelay(true));
-  server.on('clientError', (_err, socket) => {
-    if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n');
-  });
-  return server;
+  return createRawServer(handle);
 }
