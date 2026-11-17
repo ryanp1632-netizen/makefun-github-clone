@@ -19,6 +19,16 @@ export interface Res {
   headersSent: boolean;
   writeHead(status: number, headers?: Record<string, string | number>): void;
   end(body?: Buffer | string): void;
+  /** Write a complete, prebuilt keep-alive response (status line, headers and body) as is. */
+  raw(wire: Buffer): void;
+}
+
+/** A complete HTTP/1.1 response as one buffer, for callers that cache whole replies. */
+export function wireResponse(status: number, headers: Record<string, string>, body: Buffer): Buffer {
+  let head = `HTTP/1.1 ${status} ${REASONS[status] ?? 'Status'}\r\n`;
+  for (const k in headers) head += `${k}: ${headers[k]}\r\n`;
+  head += `content-length: ${body.length}\r\n\r\n`;
+  return Buffer.concat([Buffer.from(head, 'latin1'), body]);
 }
 
 const REASONS: Record<number, string> = {
@@ -43,6 +53,21 @@ class Response implements Res {
     this.socket = socket;
     this.close = close;
     this.isHead = isHead;
+  }
+  raw(wire: Buffer): void {
+    if (this.done) return;
+    if (this.close) {
+      // A cached reply is keep-alive framed; for a closing connection go through the normal path.
+      const sep = wire.indexOf('\r\n\r\n');
+      this.socket.write(Buffer.concat([wire.subarray(0, sep), Buffer.from('\r\nconnection: close\r\n\r\n', 'latin1'), wire.subarray(sep + 4)]));
+      this.done = true;
+      this.headersSent = true;
+      this.socket.end();
+      return;
+    }
+    this.done = true;
+    this.headersSent = true;
+    if (!this.socket.destroyed) this.socket.write(wire);
   }
   writeHead(status: number, headers: Record<string, string | number> = {}): void {
     this.status = status;

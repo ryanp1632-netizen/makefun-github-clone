@@ -132,7 +132,7 @@ export function issueView(i: Issue, origin: string): Record<string, unknown> {
   return v;
 }
 
-function issueJson(i: Issue, origin: string): string {
+export function issueJson(i: Issue, origin: string): string {
   if (i.json === undefined) i.json = JSON.stringify(issueView(i, origin));
   return i.json;
 }

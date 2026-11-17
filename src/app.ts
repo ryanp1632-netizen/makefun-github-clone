@@ -3,9 +3,12 @@
 // write per response); every handler is synchronous because the body arrives already read.
 
 import type { Server } from 'node:net';
-import { createRawServer, type Req, type Res } from './http1.ts';
+import { createRawServer, wireResponse, type Req, type Res } from './http1.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './githttp.ts';
-import { HttpError, dispatch, type Ctx } from './rest.ts';
+import { HttpError, dispatch, issueJson, type Ctx } from './rest.ts';
+import { getRepo } from './store.ts';
+
+const ISSUE_RE = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/;
 import { executeGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 
@@ -112,6 +115,24 @@ function handle(req: Req, res: Res): void {
 
   const body = req.body;
   const origin = `http://${req.headers.host ?? 'localhost'}`;
+
+  // Hot path: GET one issue answers a cached, fully framed reply in a single socket write.
+  if (method === 'GET' && isRestApi) {
+    const m = ISSUE_RE.exec(path);
+    if (m !== null) {
+      const repo = getRepo(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+      const issue = repo !== undefined && repo.owner.toLowerCase() === decodeURIComponent(m[1]).toLowerCase() ? repo.byNumber.get(Number(m[3])) : undefined;
+      if (issue !== undefined) {
+        const json = issueJson(issue, origin);
+        if (issue.wire === undefined || issue.wireJson !== json) {
+          issue.wire = wireResponse(200, { 'content-type': JSON_TYPE, 'x-github-request-id': `F0RG:I${issue.id.toString(16).toUpperCase()}` }, Buffer.from(json, 'utf8'));
+          issue.wireJson = json;
+        }
+        res.raw(issue.wire);
+        return;
+      }
+    }
+  }
 
   if (isMcp) {
     if (method === 'GET') return sendError(res, 405, 'Method Not Allowed: this server does not stream on GET');

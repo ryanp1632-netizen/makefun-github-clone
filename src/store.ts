@@ -75,6 +75,9 @@ export interface Issue {
   repo: Repo;
   /** Cached JSON of the REST issue view; cleared on every change. */
   json?: string;
+  /** Cached whole HTTP reply for GET of this issue, valid while `wireJson === json`. */
+  wire?: Buffer;
+  wireJson?: string;
 }
 
 export interface Pull {
