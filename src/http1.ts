@@ -153,20 +153,30 @@ export function createRawServer(handler: (req: Req, res: Res) => void): Server {
             return;
           }
           const headText = buf.toString('latin1', 0, end);
-          const lines = headText.split('\r\n');
-          const first = lines[0].split(' ');
-          if (first.length < 3 || !first[2].startsWith('HTTP/1.')) {
+          // Request line and headers in one pass over the head, without splitting it into arrays.
+          let eol = headText.indexOf('\r\n');
+          if (eol < 0) eol = headText.length;
+          const sp1 = headText.indexOf(' ');
+          const sp2 = sp1 < 0 ? -1 : headText.indexOf(' ', sp1 + 1);
+          if (sp1 <= 0 || sp2 < 0 || sp2 > eol || !headText.startsWith('HTTP/1.', sp2 + 1)) {
             badRequest(socket);
             buf = Buffer.alloc(0);
             return;
           }
+          const first = [headText.slice(0, sp1), headText.slice(sp1 + 1, sp2), headText.slice(sp2 + 1, eol)];
           const headers: Record<string, string> = {};
-          for (let k = 1; k < lines.length; k += 1) {
-            const c = lines[k].indexOf(':');
-            if (c <= 0) continue;
-            const name = lines[k].slice(0, c).trim().toLowerCase();
-            const value = lines[k].slice(c + 1).trim();
-            headers[name] = headers[name] === undefined ? value : `${headers[name]}, ${value}`;
+          let p = eol + 2;
+          while (p < headText.length) {
+            let e = headText.indexOf('\r\n', p);
+            if (e < 0) e = headText.length;
+            const c = headText.indexOf(':', p);
+            if (c > p && c < e) {
+              const name = headText.slice(p, c).trim().toLowerCase();
+              const value = headText.slice(c + 1, e).trim();
+              const prev = headers[name];
+              headers[name] = prev === undefined ? value : `${prev}, ${value}`;
+            }
+            p = e + 2;
           }
           const bodyStart = end + 4;
           let body: Buffer;
